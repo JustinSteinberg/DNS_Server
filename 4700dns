@@ -1,0 +1,161 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
+
+class Server:
+    def __init__(self, root_ip, zone_file, port):
+        self.root_ip = root_ip
+        self.zone_file = zone_file #Zone file
+        self.domain = ""
+        
+        self.zone_data = {
+            "SOA": None,
+            "NS": {},
+            "A": {},
+            "AAAA": {},
+            "CNAME": {},
+            "MX": [],
+            "TXT": {}
+        }
+        
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log("Bound to port %d" % self.port)
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+        
+    def record_response(self, record_type, domain, request):
+        """Generate a response to DNS queries. Currently only support A records.
+        """
+        if record_type == "A":
+            try: 
+                # Retrieve all A records for the domain
+                print("query domain: ", domain)
+                record_data = self.zone_data["A"].get(domain, [])
+                print("record_data: ", record_data)
+                # If there are no records, return NXDOMAIN
+                if not record_data:
+                    self.log(f"No A records found for {domain}")
+                    response = request.reply()
+                    response.header.rcode = RCODE.NXDOMAIN
+                    return response
+                
+                # Create a response and add all A records
+                response = request.reply()
+                for ip in record_data:
+                    response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
+                
+                return response
+
+            except Exception as e:
+                self.log("Could not retrieve record for %s, %s" % (domain, e))
+                response = request.reply()
+                response.header.rcode = RCODE.SERVFAIL
+                return response
+
+        
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Unpack the DNS request
+        request = DNSRecord.parse(data)
+        self.log("Received message:\n%s" % request)
+        
+        #This loop doesnt really matter because we dont support multiple questions
+        for question in request.questions:
+            domain = str(question.qname)
+            record_type = QTYPE[question.qtype]
+            
+            print(f"Domain: {domain}")
+            print(f"Type: {record_type}")
+        
+            response = self.record_response(record_type, domain, request)
+            self.send(addr, response)
+
+        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
+        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
+        
+                
+    def load_zone_file(self):
+        """Load and parse the zone file. Splits file up into DNS Records
+        """
+        self.log(f"Loading zone file: {self.zone_file}")
+
+        try:
+            zone_records = ""
+            with open(self.zone_file, "r") as file:
+                zone_records = RR.fromZone(file.read())
+
+            self.log("Records:\n%s" % zone_records)
+            
+            for record in zone_records:
+                #print("Record: ", record)
+                #print("rname: ", record.rname)
+                #print("rtype: ", record.rtype)
+                #print("QTYPE: ", QTYPE[record.rtype])
+                #print("rdata: ", record.rdata)
+
+                rtype = QTYPE[record.rtype]
+                rdata = record.rdata
+                rname = str(record.rname)
+
+                if rtype == "SOA":
+                    self.domain = rname
+                    print("Our domain: ", self.domain)
+                    
+                    self.zone_data["SOA"] = {
+                        "primary_name_server": str(rdata.mname),
+                    }
+                elif rtype == "NS":
+                    #print("IN NS")
+                    self.zone_data["NS"][rname] = (str(rdata))
+                elif rtype == "A":
+                    print("In A")
+                    print("rname: ", rname)
+                    print("data: ", str(rdata))
+                    if rname not in self.zone_data["A"]:
+                        self.zone_data["A"][rname] = []
+                    self.zone_data["A"][rname].append(str(rdata))                
+                elif rtype == "AAAA":
+                    if rname not in self.zone_data["AAAA"]:
+                        self.zone_data["AAAA"][rname] = []
+                    self.zone_data["AAAA"][rname].append(str(rdata))                
+                elif rtype == "CNAME":
+                    self.zone_data["CNAME"][rname] = str(rdata)
+                elif rtype == "MX":
+                    self.zone_data["MX"].append({"priority": rdata.preference, "mail_server": str(rdata.label)})
+                elif rtype == "TXT":
+                    self.zone_data["TXT"][rname] = str(rdata)            
+        except Exception as e:
+            self.log("Could not load zone file: %s" % e)
+
+    def run(self):
+        seq = 0
+        
+        self.load_zone_file();
+        
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    print(f"Zone file provided: {args.zone}")
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
