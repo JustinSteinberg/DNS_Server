@@ -1,7 +1,8 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE, MX, CNAME, TXT, NS
+
 
 class Server:
     def __init__(self, root_ip, zone_file, port):
@@ -9,14 +10,14 @@ class Server:
         self.zone_file = zone_file #Zone file
         self.domain = ""
         
-        self.zone_data = {
-            "SOA": None,
-            "NS": {},
-            "A": {},
-            "AAAA": {},
-            "CNAME": {},
-            "MX": [],
-            "TXT": {}
+        self.zone_data = {   # EXAMPLES
+            "SOA": None, # {'primary_name_server': 'dns1.example.com.'}
+            "NS": {}, # {'example.com.': ['dns1.example.com.', 'dns2.example.com.'], 'sub.example.com.': ['ns2.example.com.']}
+            "A": {}, #{'dns1.example.com.': ['10.0.1.1'], 'dns2.example.com.': ['10.0.1.2'], 'server1.example.com.': ['10.0.1.5'], 'server2.example.com.': ['10.0.1.6', '10.0.1.7', '10.0.1.8'], 'ns2.example.com.': ['10.0.2.1']
+            "AAAA": {}, # {'ftp.example.com.': 'mislove.org.', 'mail.example.com.': 'server1.example.com.', 'mail2.example.com.': 'server2.example.com.', 'www.example.com.': 'server1.example.com.'}
+            "CNAME": {}, # {'ftp.example.com.': 'mislove.org.', 'mail.example.com.': 'server1.example.com.', 'mail2.example.com.': 'server2.example.com.', 'www.example.com.': 'server1.example.com.'}
+            "MX": [], # [{'priority': 10, 'mail_server': 'mail.example.com.'}, {'priority': 20, 'mail_server': 'mail2.example.com.'}]
+            "TXT": {} #{'txt.example.com.': '"txttext"'}
         }
         
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -32,35 +33,194 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+
+    def load_zone_file(self):
+        """Load and parse the zone file. Splits file up into DNS Records
+        """
+        self.log(f"Loading zone file: {self.zone_file}")
+
+        try:
+            zone_records = ""
+            with open(self.zone_file, "r") as file:
+                zone_records = RR.fromZone(file.read())
+
+            self.log("Records:\n%s" % zone_records)
+
+            for record in zone_records:
+                # print("Record: ", record)
+                # print("rname: ", record.rname)
+                # print("rtype: ", record.rtype)
+                # print("QTYPE: ", QTYPE[record.rtype])
+                # print("rdata: ", record.rdata)
+
+                rtype = QTYPE[record.rtype]
+                rdata = record.rdata
+                rname = str(record.rname)
+
+                if rtype == "SOA":
+                    self.domain = rname
+                    print("Our domain: ", self.domain)
+
+                    self.zone_data["SOA"] = {
+                        "primary_name_server": str(rdata.mname),
+                    }
+                elif rtype == "NS":
+                    # print("IN NS")
+                    if rname not in self.zone_data["NS"]:
+                        self.zone_data["NS"][rname] = []
+                    self.zone_data["NS"][rname].append(str(rdata))
+                    print(self.zone_data["NS"])
+                    #print(self.zone_data["NS"])
+                elif rtype == "A":
+                    print("In A")
+                    print("rname: ", rname)
+                    print("data: ", str(rdata))
+                    if rname not in self.zone_data["A"]:
+                        self.zone_data["A"][rname] = []
+                    self.zone_data["A"][rname].append(str(rdata))
+                elif rtype == "AAAA":
+                    if rname not in self.zone_data["AAAA"]:
+                        self.zone_data["AAAA"][rname] = []
+                    self.zone_data["AAAA"][rname].append(str(rdata))
+                elif rtype == "CNAME":
+                    self.zone_data["CNAME"][rname] = str(rdata)
+                elif rtype == "MX":
+                    self.zone_data["MX"].append({"priority": rdata.preference, "mail_server": str(rdata.label)})
+                elif rtype == "TXT":
+                    self.zone_data["TXT"][rname] = str(rdata)
+
+            print(self.zone_data) # FOR DEBUGGING
+        except Exception as e:
+            self.log("Could not load zone file: %s" % e)
+
+    # checks and returns the record data for any CNAMEs that match the domain
+    def checkCNAMERecords(self, domain):
+        record_data = self.zone_data["CNAME"].get(domain, "") # this will always return 1
+        print("IN CHECK")
+        print(record_data)
+        return record_data
+
+
+    # returns the record data (so the A records for the domain)
+    def checkARecords(self, domain):
+        record_data = self.zone_data["A"].get(domain, [])
+        return record_data
+
+
+
+
         
     def record_response(self, record_type, domain, request):
-        """Generate a response to DNS queries. Currently only support A records.
+        """Generate a response to DNS queries. Currently only support A and MX records.
         """
-        if record_type == "A":
-            try: 
-                # Retrieve all A records for the domain
+        # Todo: Handle recursion with DNS flags also probably best to make these seperate functions and pass through the response to fill
+        try:
+            if record_type == "A":
+
+                # check if there are a's that match with the domain
+                # if there is, do the add answer for each of them in record data
+                # if not, check if there is a cname for that
+                # if there is, add it to the answer, then check for a's with that domain
+                # if there is, add it to the answer
+                # if not, send answer???
+                response = request.reply()
                 print("query domain: ", domain)
-                record_data = self.zone_data["A"].get(domain, [])
+                record_data = self.checkARecords(domain)
+                if not record_data:
+                    altName = self.checkCNAMERecords(domain)
+                    if altName == "":
+                        self.log(f"No A records found for {domain}")
+
+                        response.header.rcode = RCODE.NXDOMAIN
+                        return response
+                    else:
+                        response.add_answer(RR(domain, QTYPE.CNAME, ttl=60, rdata=CNAME(altName)))
+                        aForCNAME = self.checkARecords(altName)
+                        for aRec in aForCNAME:
+                            response.add_answer(RR(altName, QTYPE.A, ttl=60, rdata=A(aRec)))
+                        return response
+                else:
+                    for ip in record_data:
+                        print(ip)
+                        response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
+                    return response
+
+                # response = request.reply()
+                # # Retrieve all A records for the domain
+                # print("query domain: ", domain)
+                # record_data = self.zone_data["A"].get(domain, [])
+                # print("record_data: ", record_data)
+                # # If there are no records, return NXDOMAIN
+                # if not record_data:
+                #     self.log(f"No A records found for {domain}")
+                #
+                #     response.header.rcode = RCODE.NXDOMAIN
+                #     return response
+                #
+                # # Create a response and add all A records
+                # response = request.reply()
+                # for ip in record_data:
+                #     print(ip)
+                #     response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
+                #
+                # return response
+
+            if record_type == "MX":
+                # Retrieve all MX records for the domain
+                print("query domain: ", domain)
+                record_data = self.zone_data["MX"]
                 print("record_data: ", record_data)
                 # If there are no records, return NXDOMAIN
-                if not record_data:
-                    self.log(f"No A records found for {domain}")
+                if len(record_data) == 0:
+                    self.log(f"No MX records found for {domain}")
                     response = request.reply()
-                    response.header.rcode = RCODE.NXDOMAIN
+                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
                     return response
-                
-                # Create a response and add all A records
+
+                # Create a response and add all MX records with their priorities and MX
                 response = request.reply()
-                for ip in record_data:
-                    response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
-                
+                for mx in record_data:
+                    response.add_answer(RR(domain, QTYPE.MX, rdata=MX(mx["mail_server"], preference=mx["priority"]), ttl=60))
+
                 return response
 
-            except Exception as e:
-                self.log("Could not retrieve record for %s, %s" % (domain, e))
+            if record_type == "TXT":
+                print("query domain: ", domain)
+                record_data = self.zone_data["TXT"].get(domain, "")
+                print("record_data: ", record_data)
+                if len(record_data) == 0:
+                    self.log(f"No TXT records found for {domain}")
+                    response = request.reply()
+                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
+                    return response
+                else:
+                    response = request.reply()
+                    response.add_answer(RR(domain, QTYPE.TXT, rdata=TXT(record_data.strip("""\""""))))
+                    return response
+
+            if record_type == "NS":
                 response = request.reply()
-                response.header.rcode = RCODE.SERVFAIL
-                return response
+                print("query domain: ", domain)
+                record_data = self.zone_data["NS"].get(domain, [])
+                if len(record_data) == 0:
+                    self.log(f"No NS records found for {domain}")
+                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
+                    return response
+                else:
+                    for ns in record_data:
+                        response.add_answer(RR(domain, QTYPE.NS, rdata=NS(ns)))
+                        associated = self.checkARecords(ns)
+                        for aRec in associated:
+                            response.add_ar(RR(ns, QTYPE.A, rdata=A(aRec), ttl=60))
+                    return response
+
+
+        except Exception as e:
+            self.log("Could not retrieve record for %s, record_type: %s, %s" % (domain, record_type, e))
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+            return response
+
 
         
     def recv(self, socket):
@@ -71,6 +231,7 @@ class Server:
         self.log("Received message:\n%s" % request)
         
         #This loop doesnt really matter because we dont support multiple questions
+        # Todo: add a check if there is multiple questions to just do SERVFAIL
         for question in request.questions:
             domain = str(question.qname)
             record_type = QTYPE[question.qtype]
@@ -83,66 +244,13 @@ class Server:
 
         # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
         # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-        
-                
-    def load_zone_file(self):
-        """Load and parse the zone file. Splits file up into DNS Records
-        """
-        self.log(f"Loading zone file: {self.zone_file}")
 
-        try:
-            zone_records = ""
-            with open(self.zone_file, "r") as file:
-                zone_records = RR.fromZone(file.read())
-
-            self.log("Records:\n%s" % zone_records)
-            
-            for record in zone_records:
-                #print("Record: ", record)
-                #print("rname: ", record.rname)
-                #print("rtype: ", record.rtype)
-                #print("QTYPE: ", QTYPE[record.rtype])
-                #print("rdata: ", record.rdata)
-
-                rtype = QTYPE[record.rtype]
-                rdata = record.rdata
-                rname = str(record.rname)
-
-                if rtype == "SOA":
-                    self.domain = rname
-                    print("Our domain: ", self.domain)
-                    
-                    self.zone_data["SOA"] = {
-                        "primary_name_server": str(rdata.mname),
-                    }
-                elif rtype == "NS":
-                    #print("IN NS")
-                    self.zone_data["NS"][rname] = (str(rdata))
-                elif rtype == "A":
-                    print("In A")
-                    print("rname: ", rname)
-                    print("data: ", str(rdata))
-                    if rname not in self.zone_data["A"]:
-                        self.zone_data["A"][rname] = []
-                    self.zone_data["A"][rname].append(str(rdata))                
-                elif rtype == "AAAA":
-                    if rname not in self.zone_data["AAAA"]:
-                        self.zone_data["AAAA"][rname] = []
-                    self.zone_data["AAAA"][rname].append(str(rdata))                
-                elif rtype == "CNAME":
-                    self.zone_data["CNAME"][rname] = str(rdata)
-                elif rtype == "MX":
-                    self.zone_data["MX"].append({"priority": rdata.preference, "mail_server": str(rdata.label)})
-                elif rtype == "TXT":
-                    self.zone_data["TXT"][rname] = str(rdata)            
-        except Exception as e:
-            self.log("Could not load zone file: %s" % e)
 
     def run(self):
         seq = 0
         
-        self.load_zone_file();
-        
+        self.load_zone_file()
+
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
             for conn in socks:
