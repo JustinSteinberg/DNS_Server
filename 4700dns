@@ -10,6 +10,8 @@ class Server:
         self.zone_file = zone_file #Zone file
         self.domain = ""
         
+        self.unresolved_queries = {}
+        
         self.zone_data = {   # EXAMPLES
             "SOA": None, # {'primary_name_server': 'dns1.example.com.'}
             "NS": {}, # {'example.com.': ['dns1.example.com.', 'dns2.example.com.'], 'sub.example.com.': ['ns2.example.com.']}
@@ -105,11 +107,14 @@ class Server:
     def checkARecords(self, domain):
         record_data = self.zone_data["A"].get(domain, [])
         return record_data
-
-
-
-
+    
+    def check_is_authoritative(self, queried_domain):
         
+        if queried_domain.endswith(self.domain):
+            return True
+        
+        return False        
+
     def record_response(self, record_type, domain, request):
         """Generate a response to DNS queries. Currently only support A and MX records.
         """
@@ -219,8 +224,7 @@ class Server:
             self.log("Could not retrieve record for %s, record_type: %s, %s" % (domain, record_type, e))
             response = request.reply()
             response.header.rcode = RCODE.SERVFAIL
-            return response
-
+            return response        
 
         
     def recv(self, socket):
@@ -230,22 +234,48 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
         
-        #This loop doesnt really matter because we dont support multiple questions
-        # Todo: add a check if there is multiple questions to just do SERVFAIL
-        for question in request.questions:
-            domain = str(question.qname)
-            record_type = QTYPE[question.qtype]
-            
-            print(f"Domain: {domain}")
-            print(f"Type: {record_type}")
+        if addr[0] == self.root_ip:
+            self.log("Response from root server received")
+            # Forward the root server's response back to the original client
+            print("Root response header ID: ", request.header.id)
+            request.header.aa = 0  # Ensure the AA flag is unset
+            request.header.ra = 1  # Set the RA flag (recursion available)
+            original_client = self.unresolved_queries.pop(request.header.id, None)
+            if original_client:
+                self.log("Sending message from ROOT back to Client:\n%s" % request)
+                self.send(original_client, request)
+            else:
+                self.log("No matching client for this response")
+            return
+
         
+        if len(request.questions) > 1:
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+            self.send(addr, response)
+            return
+             
+        question = request.questions[0]
+        domain = str(question.qname)
+        record_type = QTYPE[question.qtype]
+        
+        print(f"Domain: {domain}")
+        print(f"Type: {record_type}")
+
+        #Check if we are authority
+        if self.check_is_authoritative(domain):
+            response.header.aa = 1  # Ensure the AA flag set
             response = self.record_response(record_type, domain, request)
             self.send(addr, response)
+        else:
+            self.log(f"Forwarding query to root server: {self.root_ip}")
+            self.log(f"Sending message from CLIENT TO ROOT:\n%s" % request)
+            self.socket.sendto(request.pack(), (self.root_ip, 60053))
+            print("Client request header ID: ", request.header.id)
+            self.unresolved_queries[request.header.id] = addr
 
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-
-
+        
+                
     def run(self):
         seq = 0
         
@@ -264,6 +294,7 @@ if __name__ == "__main__":
     parser.add_argument('zone', type=str, help="The zone file for this server")
     parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
     args = parser.parse_args()
+    print(f"Root IP:  {args.root_ip}")
     print(f"Zone file provided: {args.zone}")
     sender = Server(args.root_ip, args.zone, args.port)
     sender.run()
