@@ -35,6 +35,17 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+        
+    def send_to_client(self, response, client_addr, original_query_id, original_query):
+        """
+        Sends the response back to the client with necessary modifications.
+        """
+        response.header.id = original_query_id
+        response.questions = original_query.questions
+        response.header.ra = 1
+        response.header.aa = 0
+        self.socket.sendto(response.pack(), client_addr)
+        self.log(f"Response sent to client at {client_addr}.")
 
     def load_zone_file(self):
         """Load and parse the zone file. Splits file up into DNS Records
@@ -114,19 +125,13 @@ class Server:
             return True
         
         return False
-
-    # def recur(self, sections, record_type, request, addr, round):
-    #     if sections[0] == round:
-    #         self.log(f"Forwarding query to root server: {self.root_ip}")
-    #         self.log(f"Sending message from CLIENT TO ROOT:\n%s" % request)
-    #         self.socket.sendto(request.pack(), (self.root_ip, 60053))
-    #         self.socket.sendto(request.pack(), (self.root_ip, 60053))  # one more for robustness, we can handle it
-    #         print("Client request header ID: ", request.header.id)
-    #         self.unresolved_queries[request.header.id] = addr
-    #         print(self.unresolved_queries)
-    #     else:
-    #         print("WORKING ON IT")
-
+    
+    def is_authoritative(self, response):
+          # Parse the response using dnslib
+        dns_record = DNSRecord.parse(response)
+        
+        # Check the AA (Authoritative Answer) flag
+        return dns_record.header.aa
 
 
     def record_response(self, record_type, domain, request):
@@ -164,25 +169,6 @@ class Server:
                         response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
                     return response
 
-                # response = request.reply()
-                # # Retrieve all A records for the domain
-                # print("query domain: ", domain)
-                # record_data = self.zone_data["A"].get(domain, [])
-                # print("record_data: ", record_data)
-                # # If there are no records, return NXDOMAIN
-                # if not record_data:
-                #     self.log(f"No A records found for {domain}")
-                #
-                #     response.header.rcode = RCODE.NXDOMAIN
-                #     return response
-                #
-                # # Create a response and add all A records
-                # response = request.reply()
-                # for ip in record_data:
-                #     print(ip)
-                #     response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
-                #
-                # return response
 
             if record_type == "MX":
                 # Retrieve all MX records for the domain
@@ -240,69 +226,238 @@ class Server:
             response.header.rcode = RCODE.SERVFAIL
             return response        
 
-        
-    def recv(self, socket):
-        data, addr = socket.recvfrom(65535)
 
-        # Unpack the DNS request
-        request = DNSRecord.parse(data)
-        self.log("Received message:\n%s \nip: %s port: %d" % (request, addr[0], addr[1]))
+    def send_dns_query(self, domain, record_type="A", next_server=None, client_addr=None, original_query_id=None, original_query=None):
+        """
+        Send DNS Query to the next server and adds the query to the unresolved_queries list.
+        We add a timestamp to unresolved queries for later usage.
+        We also keep track of the original clients address, the original query id, the type
+        of record its requesting, and a copy of the query itself.
+        """
+        if not next_server:
+            self.log("No root server provided. Returning SERVFAIL.")
+            response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
+            response.add_question(DNSRecord.question(domain, record_type))
+            response.header.id = original_query_id
+            self.socket.sendto(response.pack(), client_addr)
+            return
+
+        self.log(f"Starting recursive resolution for {domain} on server {next_server}")
+
+        # Create and send the DNS query
+        query = DNSRecord.question(domain, record_type)
+        query_data = query.pack()
+
+        if original_query is None:
+            original_query = query
+
+        # Track the query metadata
+        message_id = query.header.id
+        self.unresolved_queries[message_id] = {
+            "client_addr": client_addr,
+            "original_query_id": original_query_id,
+            "domain": domain,
+            "record_type": record_type,
+            "timestamp": time.time(),
+            "original_query": original_query,
+        }
         
-        if addr[0] == self.root_ip:
-            self.log("Response from root server received")
-            # Forward the root server's response back to the original client
-            self.log("Root response header ID: %s" % request.header.id)
-            request.header.aa = 0  # Ensure the AA flag is unset
-            request.header.ra = 1  # Set the RA flag (recursion available)
-            original_client = self.unresolved_queries.pop(request.header.id, None)
-            self.log("AFTER POP")
-            self.log(str(self.unresolved_queries))
-            if original_client:
-                self.log("Sending message from ROOT back to Client:\n%s" % request)
-                self.send(original_client, request)
+        self.log(f"Query sent to {next_server} for {domain} (ID: {query.header.id})")
+        
+        self.socket.sendto(query_data, (next_server, 60053))
+        
+    def send_servfail_to_client(self, domain, record_type, client_addr, original_query_id):
+        """
+        Sends a SERVFAIL response to the client.
+        """
+        response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
+        response.add_question(DNSRecord.question(domain, record_type))
+        response.header.id = original_query_id
+        self.socket.sendto(response.pack(), client_addr)
+        self.log(f"SERVFAIL response sent to client at {client_addr}.")
+        
+    def query_next_server(self, response, domain, record_type, client_addr, original_query_id, original_query):
+        """
+        Queries the next server we need to send QUERY to based on the response.
+        """
+        a_records_answer = self.find_records(response.ar, QTYPE.A)
+        next_servers = [str(record.rdata) for record in a_records_answer]
+        
+        if next_servers:
+            # Loop through all A records and send queries to each server
+            for server in next_servers:
+                self.log(f"Querying next server: {server} for {domain} for record type {record_type}.")
+                self.send_dns_query(domain, record_type, server, client_addr, original_query_id, original_query)
+        else:
+            # If no A records, fall back to NS records
+            nameserver_records = self.find_records(response.auth, QTYPE.NS)
+            nameserver_data = [str(record.rdata) for record in nameserver_records]
+            
+            if nameserver_data:
+                self.log("Resolving NS records to IP addresses for further queries.")
+                # Query the root server to resolve the NS names into IPs
+                for ns in nameserver_data:
+                    self.send_dns_query(ns, "A", self.root_ip, client_addr, original_query_id, original_query)
             else:
-                self.log("No matching client for this response")
+                self.log("No servers left to query. Returning SERVFAIL.")
+                self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
+                
+    def find_records(self, records, rtype, domain=None):
+        """
+        Function to find DNS records of a specific type and domain in 
+        a specific section (ANSWER, AUTHORITATIVE, ADDITIONAL).
+        If domain is not provided then return all records of that type in 
+        corresponding section. reecords is a list of DNS records to search.
+        rtype is the record type to search for (e.g., QTYPE.A, QTYPE.MX) and 
+        the domain is the name to match against the records against.
+        """
+        
+        matching_records = []
+        for record in records:
+            if record.rtype == rtype:
+                if domain is None or str(record.rname) == domain:
+                    matching_records.append(record)
+        return matching_records
+
+    def handle_other_DNS_server_response(self, data):
+        """
+        Handles responses from other DNS servers, handling each record type.
+        """
+        self.log("Processing response from upstream server")
+
+        # Parse the DNS response
+        response = DNSRecord.parse(data)
+        self.log(f"DNS SERVER RESPONSE: {response}")
+        message_id = response.header.id
+
+        # Verify the message ID is expected
+        if message_id not in self.unresolved_queries:
+            self.log(f"Unexpected response ID {message_id}. Ignoring.")
             return
 
+        # Extract query metadata
+        query_metadata = self.unresolved_queries.pop(message_id)
+        client_addr = query_metadata["client_addr"]
+        original_query_id = query_metadata["original_query_id"]
+        domain = query_metadata["domain"]
+        record_type = query_metadata["record_type"]
+        original_query = query_metadata["original_query"]
+       #original_domain = original_query.questions[0].qname  # Access the first question in the section
+
+        # Check if the response is authoritative
+        #cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
         
-        if len(request.questions) > 1:
-            response = request.reply()
-            response.header.rcode = RCODE.SERVFAIL
-            self.send(addr, response)
+        if response.header.aa:
+            self.log("Authoritative response received. Forwarding to client.")
+            self.send_to_client(response, client_addr, original_query_id, original_query)
             return
-             
+        #elif response.header.aa and len(cname_records) > 0:
+           # record_type = "CNAME"
+            
+        # Process response based on the record type
+        #Here we get all the A records in the additional section 
+        #If there are A records in the additional section WITH THE SPECIFIC DOMAIN, send to client
+        #OTHERWISE we go through all the other A Records 
+        if record_type == "A":
+            self.log("Handling A record.")
+            a_records = self.find_records(response.ar, QTYPE.A, domain)
+            
+            if a_records:
+                self.log(f"Valid A records for {domain} found. Forwarding to client.")
+                self.send_to_client(response, client_addr, original_query_id, original_query)
+            else:
+                self.log(f"No valid A records for {domain}. Querying next server.")
+                self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
+                
+        #there might be an issue with CNAME records in ANSWER section because we are replacing the ORIGINAL DOMAIN NAME 
+        # WITH THE CNAME ALIAS IN THE QUESTION SECTION. So when we send back the RESPONSE to the client, the QUESTION
+        # SECTION now has the alias in the Question, not the original domain. I think we need to PRESERVE 
+        # the ORIGINAL domian somehow while also using the CNAME name for performing THE DNS QUERY
+        
+        #THE ABOVE WAS SOLVED BY PASSING THE ORIGINAL QUERY THROUGHOUT THE CALLS TO BE SAVED IN
+        #unresolved_queries which could be used to update the Question Section with the appropriate domain
+        elif record_type == "CNAME":
+            self.log("Handling CNAME record.")
+            cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
+            
+            if cname_records:
+                resolved_name = str(cname_records[0].rdata)
+                self.log(f"Resolving CNAME: {domain} -> {resolved_name}")
+                self.send_dns_query(resolved_name, "A", self.root_ip, client_addr, original_query_id, original_query)
+            else:
+                self.log("No valid CNAME records found. Returning SERVFAIL.")
+                self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
+
+        elif record_type == "MX":
+            self.log("Handling MX record.")
+            mx_records = self.find_records(response.rr, QTYPE.MX, domain)
+            
+            if mx_records:
+                self.log("Valid MX records found. Forwarding to client.")
+                self.send_to_client(response, client_addr, original_query_id, original_query)
+            else:
+                self.log("No MX records found. Querying next server.")
+                self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
+
+        elif record_type == "TXT":
+            self.log("Handling TXT record.")
+            txt_records = self.find_records(response.rr, QTYPE.TXT, domain)
+            if txt_records:
+                self.log("Valid TXT records found. Forwarding to client.")
+                self.send_to_client(response, client_addr, original_query_id, original_query)
+            else:
+                self.log("No TXT records found. Querying next server.")
+                self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
+
+        elif record_type == "NS":
+            self.log("Handling NS record.")
+            ns_records = [record for record in response.auth if record.rtype == QTYPE.NS]
+            additional_a_records = [record for record in response.ar if record.rtype == QTYPE.A]
+            if ns_records and additional_a_records:
+                self.log("NS records with additional A records found. Forwarding to client.")
+                self.send_to_client(response, client_addr, original_query_id, original_query)
+            else:
+                self.log("Resolving NS records to IP addresses.")
+                for ns in ns_records:
+                    self.send_dns_query(str(ns.rdata), "A", self.root_ip, client_addr, original_query_id, original_query)
+
+        else:
+            self.log(f"Unhandled record type {record_type}. Returning SERVFAIL.")
+            self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
+
+
+    def handle_client_query(self, data, addr):
+        """
+        Handles requests from clients.
+        """
+        self.log("Client Query")
+        # Parse and handle a client DNS query
+        request = DNSRecord.parse(data)
         question = request.questions[0]
         domain = str(question.qname)
         record_type = QTYPE[question.qtype]
-        
-        self.log(f"Domain: {domain}")
-        self.log(f"Type: {record_type}")
+        self.log(f"Received query for {domain} (Type: {record_type}) from {addr}")
 
-
-        #Check if we are authority
         if self.check_is_authoritative(domain):
+            # Generate an authoritative response
             response = self.record_response(record_type, domain, request)
-            response.header.aa = 1  # Ensure the AA flag set
-            self.send(addr, response)
+            response.header.id = request.header.id
+            self.log(f"Sending authoritative response to {addr}")
+            self.socket.sendto(response.pack(), addr)
         else:
-            # ASK ANOTHER DNS SERVER, we need to add cache later.
-            # if we ask for the smallest domain (ex: is .ns to root), then the next until we get the orginal query domain
-            # sections = domain.split(".")
-            # self.recur(sections, record_type, request, addr, sections[len(sections)-1])
+            # Forward query to the root server to resolve an appopriate answer
+            self.log(f"Forwarding query for {domain} to root server")
+            self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id)
 
-
-            self.log(f"Forwarding query to root server: {self.root_ip}")
-            self.log(f"Sending message from CLIENT TO ROOT:\n%s" % request)
-            self.socket.sendto(request.pack(), (self.root_ip, 60053))
-            #self.socket.sendto(request.pack(), (self.root_ip, 60053)) # one more for robustness, we can handle it
-            # self.socket.sendto(request.pack(), (self.root_ip, 60053))  # one more for robustness, we can handle it
-            self.log("Client request header ID: %s" % request.header.id)
-            self.unresolved_queries[request.header.id] = addr
-            self.log("UNRESLOVED QUERY ADDED")
-            self.log(str(self.unresolved_queries))
-
-        
-                
+    
+    def recv(self, socket):
+        # Handle incoming requests and upstream responses
+        data, addr = socket.recvfrom(65535)
+        if addr[1] == 60053:
+            self.handle_other_DNS_server_response(data)
+        else:  # Client query
+            self.handle_client_query(data, addr)
+            
     def run(self):
         seq = 0
         
