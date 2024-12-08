@@ -246,7 +246,7 @@ class Server:
 
         # Unpack the DNS request
         request = DNSRecord.parse(data)
-        self.log("Received message:\n%s %d" % (request, addr))
+        self.log("Received message:\n%s \nip: %s port: %d" % (request, addr[0], addr[1]))
         
         if addr[0] == self.root_ip:
             self.log("Response from root server received")
