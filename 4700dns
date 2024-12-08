@@ -61,7 +61,7 @@ class Server:
 
                 if rtype == "SOA":
                     self.domain = rname
-                    print("Our domain: ", self.domain)
+                    self.log("Our domain: %s" % self.domain)
 
                     self.zone_data["SOA"] = {
                         "primary_name_server": str(rdata.mname),
@@ -71,12 +71,12 @@ class Server:
                     if rname not in self.zone_data["NS"]:
                         self.zone_data["NS"][rname] = []
                     self.zone_data["NS"][rname].append(str(rdata))
-                    print(self.zone_data["NS"])
+                    self.log(self.zone_data["NS"])
                     #print(self.zone_data["NS"])
                 elif rtype == "A":
-                    print("In A")
-                    print("rname: ", rname)
-                    print("data: ", str(rdata))
+                    #print("In A")
+                    #print("rname: ", rname)
+                    #print("data: ", str(rdata))
                     if rname not in self.zone_data["A"]:
                         self.zone_data["A"][rname] = []
                     self.zone_data["A"][rname].append(str(rdata))
@@ -91,15 +91,15 @@ class Server:
                 elif rtype == "TXT":
                     self.zone_data["TXT"][rname] = str(rdata)
 
-            print(self.zone_data) # FOR DEBUGGING
+           # print(self.zone_data) # FOR DEBUGGING
         except Exception as e:
             self.log("Could not load zone file: %s" % e)
 
     # checks and returns the record data for any CNAMEs that match the domain
     def checkCNAMERecords(self, domain):
         record_data = self.zone_data["CNAME"].get(domain, "") # this will always return 1
-        print("IN CHECK")
-        print(record_data)
+       # print("IN CHECK")
+        #print(record_data)
         return record_data
 
 
@@ -113,7 +113,21 @@ class Server:
         if queried_domain.endswith(self.domain):
             return True
         
-        return False        
+        return False
+
+    # def recur(self, sections, record_type, request, addr, round):
+    #     if sections[0] == round:
+    #         self.log(f"Forwarding query to root server: {self.root_ip}")
+    #         self.log(f"Sending message from CLIENT TO ROOT:\n%s" % request)
+    #         self.socket.sendto(request.pack(), (self.root_ip, 60053))
+    #         self.socket.sendto(request.pack(), (self.root_ip, 60053))  # one more for robustness, we can handle it
+    #         print("Client request header ID: ", request.header.id)
+    #         self.unresolved_queries[request.header.id] = addr
+    #         print(self.unresolved_queries)
+    #     else:
+    #         print("WORKING ON IT")
+
+
 
     def record_response(self, record_type, domain, request):
         """Generate a response to DNS queries. Currently only support A and MX records.
@@ -129,7 +143,7 @@ class Server:
                 # if there is, add it to the answer
                 # if not, send answer???
                 response = request.reply()
-                print("query domain: ", domain)
+                self.log("query domain: %s" % domain)
                 record_data = self.checkARecords(domain)
                 if not record_data:
                     altName = self.checkCNAMERecords(domain)
@@ -146,7 +160,7 @@ class Server:
                         return response
                 else:
                     for ip in record_data:
-                        print(ip)
+                        #print(ip)
                         response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
                     return response
 
@@ -172,9 +186,9 @@ class Server:
 
             if record_type == "MX":
                 # Retrieve all MX records for the domain
-                print("query domain: ", domain)
+                #print("query domain: ", domain)
                 record_data = self.zone_data["MX"]
-                print("record_data: ", record_data)
+                #print("record_data: ", record_data)
                 # If there are no records, return NXDOMAIN
                 if len(record_data) == 0:
                     self.log(f"No MX records found for {domain}")
@@ -190,9 +204,9 @@ class Server:
                 return response
 
             if record_type == "TXT":
-                print("query domain: ", domain)
+                #print("query domain: ", domain)
                 record_data = self.zone_data["TXT"].get(domain, "")
-                print("record_data: ", record_data)
+                #print("record_data: ", record_data)
                 if len(record_data) == 0:
                     self.log(f"No TXT records found for {domain}")
                     response = request.reply()
@@ -205,7 +219,7 @@ class Server:
 
             if record_type == "NS":
                 response = request.reply()
-                print("query domain: ", domain)
+               # print("query domain: ", domain)
                 record_data = self.zone_data["NS"].get(domain, [])
                 if len(record_data) == 0:
                     self.log(f"No NS records found for {domain}")
@@ -232,15 +246,17 @@ class Server:
 
         # Unpack the DNS request
         request = DNSRecord.parse(data)
-        self.log("Received message:\n%s" % request)
+        self.log("Received message:\n%s %d" % (request, addr))
         
         if addr[0] == self.root_ip:
             self.log("Response from root server received")
             # Forward the root server's response back to the original client
-            print("Root response header ID: ", request.header.id)
+            self.log("Root response header ID: %s" % request.header.id)
             request.header.aa = 0  # Ensure the AA flag is unset
             request.header.ra = 1  # Set the RA flag (recursion available)
             original_client = self.unresolved_queries.pop(request.header.id, None)
+            self.log("AFTER POP")
+            self.log(str(self.unresolved_queries))
             if original_client:
                 self.log("Sending message from ROOT back to Client:\n%s" % request)
                 self.send(original_client, request)
@@ -259,20 +275,31 @@ class Server:
         domain = str(question.qname)
         record_type = QTYPE[question.qtype]
         
-        print(f"Domain: {domain}")
-        print(f"Type: {record_type}")
+        self.log(f"Domain: {domain}")
+        self.log(f"Type: {record_type}")
+
 
         #Check if we are authority
         if self.check_is_authoritative(domain):
-            response.header.aa = 1  # Ensure the AA flag set
             response = self.record_response(record_type, domain, request)
+            response.header.aa = 1  # Ensure the AA flag set
             self.send(addr, response)
         else:
+            # ASK ANOTHER DNS SERVER, we need to add cache later.
+            # if we ask for the smallest domain (ex: is .ns to root), then the next until we get the orginal query domain
+            # sections = domain.split(".")
+            # self.recur(sections, record_type, request, addr, sections[len(sections)-1])
+
+
             self.log(f"Forwarding query to root server: {self.root_ip}")
             self.log(f"Sending message from CLIENT TO ROOT:\n%s" % request)
             self.socket.sendto(request.pack(), (self.root_ip, 60053))
-            print("Client request header ID: ", request.header.id)
+            #self.socket.sendto(request.pack(), (self.root_ip, 60053)) # one more for robustness, we can handle it
+            # self.socket.sendto(request.pack(), (self.root_ip, 60053))  # one more for robustness, we can handle it
+            self.log("Client request header ID: %s" % request.header.id)
             self.unresolved_queries[request.header.id] = addr
+            self.log("UNRESLOVED QUERY ADDED")
+            self.log(str(self.unresolved_queries))
 
         
                 
