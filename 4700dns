@@ -412,8 +412,9 @@ class Server:
 
         elif record_type == "NS":
             self.log("Handling NS record.")
-            ns_records = [record for record in response.auth if record.rtype == QTYPE.NS]
-            additional_a_records = [record for record in response.ar if record.rtype == QTYPE.A]
+            ns_records = self.find_records(response.auth, QTYPE.NS)
+            additional_a_records = self.find_records(response.ar, QTYPE.A)
+            
             if ns_records and additional_a_records:
                 self.log("NS records with additional A records found. Forwarding to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
