@@ -333,7 +333,7 @@ class Server:
 
         # Verify the message ID is expected
         if message_id not in self.unresolved_queries:
-            self.log(f"Unexpected response ID {message_id}. Ignoring.")
+            self.log(f"Unexpected response ID {message_id}.")
             return
 
         # Extract query metadata
@@ -349,7 +349,7 @@ class Server:
         cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
         
         if response.header.aa and len(cname_records) == 0:
-            self.log("Authoritative response received. Forwarding to client.")
+            self.log("Authoritative response received, sending to client.")
             self.send_to_client(response, client_addr, original_query_id, original_query)
             return
         elif response.header.aa and len(cname_records) > 0:
@@ -364,10 +364,10 @@ class Server:
             a_records = self.find_records(response.ar, QTYPE.A, domain)
             
             if a_records:
-                self.log(f"A records for {domain} found. Forwarding to client.")
+                self.log(f"A records for {domain} found, sending to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
-                self.log(f"No A records for {domain}. Querying next server.")
+                self.log(f"No A records for {domain}, querying next server.")
                 self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
                 
         #there might be an issue with CNAME records in ANSWER section because we are replacing the ORIGINAL DOMAIN NAME 
@@ -383,10 +383,10 @@ class Server:
             
             if cname_records:
                 resolved_name = str(cname_records[0].rdata)
-                self.log(f"Resolving CNAME: {domain} -> {resolved_name}")
+                self.log(f"THE CNAME: {domain} -> {resolved_name}")
                 self.send_dns_query(resolved_name, "A", self.root_ip, client_addr, original_query_id, original_query)
             else:
-                self.log("No CNAME records found. Returning SERVFAIL.")
+                self.log("No CNAME records found, sending SERVFAIL.")
                 self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
 
         elif record_type == "MX":
@@ -394,10 +394,10 @@ class Server:
             mx_records = self.find_records(response.rr, QTYPE.MX, domain)
             
             if mx_records:
-                self.log(" MX records found. Forwarding to client.")
+                self.log("MX records found, sending to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
-                self.log("No MX records found. Querying next server.")
+                self.log("No MX records found, querying next server.")
                 self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
 
         elif record_type == "TXT":
@@ -416,7 +416,7 @@ class Server:
             additional_a_records = self.find_records(response.ar, QTYPE.A)
             
             if ns_records and additional_a_records:
-                self.log("NS records with additional A records found. Forwarding to client.")
+                self.log("NS records with additional A records found, sending to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
                 self.log("Resolving NS records to IP addresses.")
@@ -424,7 +424,7 @@ class Server:
                     self.send_dns_query(str(ns.rdata), "A", self.root_ip, client_addr, original_query_id, original_query)
 
         else:
-            self.log(f"Unhandled record type {record_type}. Returning SERVFAIL.")
+            self.log(f"Unknown record type {record_type}. Sending SERVFAIL.")
             self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
 
 
