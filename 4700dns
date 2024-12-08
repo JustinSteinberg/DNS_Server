@@ -44,6 +44,7 @@ class Server:
         response.questions = original_query.questions
         response.header.ra = 1
         response.header.aa = 0
+        response.header.tc = 0
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"Response sent to client at {client_addr}.")
 
@@ -278,7 +279,7 @@ class Server:
         
     def query_next_server(self, response, domain, record_type, client_addr, original_query_id, original_query):
         """
-        Queries the next server we need to send QUERY to based on the response.
+        Gets the next server we need to send our QUERY to based on the response.
         """
         a_records_answer = self.find_records(response.ar, QTYPE.A)
         next_servers = [str(record.rdata) for record in a_records_answer]
@@ -345,14 +346,14 @@ class Server:
        #original_domain = original_query.questions[0].qname  # Access the first question in the section
 
         # Check if the response is authoritative
-        #cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
+        cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
         
-        if response.header.aa:
+        if response.header.aa and len(cname_records) == 0:
             self.log("Authoritative response received. Forwarding to client.")
             self.send_to_client(response, client_addr, original_query_id, original_query)
             return
-        #elif response.header.aa and len(cname_records) > 0:
-           # record_type = "CNAME"
+        elif response.header.aa and len(cname_records) > 0:
+            record_type = "CNAME"
             
         # Process response based on the record type
         #Here we get all the A records in the additional section 
@@ -363,10 +364,10 @@ class Server:
             a_records = self.find_records(response.ar, QTYPE.A, domain)
             
             if a_records:
-                self.log(f"Valid A records for {domain} found. Forwarding to client.")
+                self.log(f"A records for {domain} found. Forwarding to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
-                self.log(f"No valid A records for {domain}. Querying next server.")
+                self.log(f"No A records for {domain}. Querying next server.")
                 self.query_next_server(response, domain, record_type, client_addr, original_query_id, original_query)
                 
         #there might be an issue with CNAME records in ANSWER section because we are replacing the ORIGINAL DOMAIN NAME 
@@ -385,7 +386,7 @@ class Server:
                 self.log(f"Resolving CNAME: {domain} -> {resolved_name}")
                 self.send_dns_query(resolved_name, "A", self.root_ip, client_addr, original_query_id, original_query)
             else:
-                self.log("No valid CNAME records found. Returning SERVFAIL.")
+                self.log("No CNAME records found. Returning SERVFAIL.")
                 self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
 
         elif record_type == "MX":
@@ -393,7 +394,7 @@ class Server:
             mx_records = self.find_records(response.rr, QTYPE.MX, domain)
             
             if mx_records:
-                self.log("Valid MX records found. Forwarding to client.")
+                self.log(" MX records found. Forwarding to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
                 self.log("No MX records found. Querying next server.")
@@ -403,7 +404,7 @@ class Server:
             self.log("Handling TXT record.")
             txt_records = self.find_records(response.rr, QTYPE.TXT, domain)
             if txt_records:
-                self.log("Valid TXT records found. Forwarding to client.")
+                self.log(" TXT records found. Forwarding to client.")
                 self.send_to_client(response, client_addr, original_query_id, original_query)
             else:
                 self.log("No TXT records found. Querying next server.")
