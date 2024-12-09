@@ -44,7 +44,16 @@ class Server:
         record_type = QTYPE[query.questions[0].qtype]
         domain = query.questions[0].qname
         time_added = time.time()
-        self.cache.update({(record_type, domain) : (response, time_added, response.rr[0].ttl)})
+        if len(response.rr) > 0:
+            self.cache.update({(record_type, domain): (response, time_added, response.rr[0].ttl)})
+        elif len(response.auth) > 0:
+            self.cache.update({(record_type, domain): (response, time_added, response.auth[0].ttl)})
+        elif len(response.ar) > 0:
+            self.cache.update({(record_type, domain): (response, time_added, response.ar[0].ttl)})
+        else:
+            self.log("No point in caching, probably bailiwick")
+            return
+
         self.log(str(time_added))
         self.log("CACHE:\n")
         self.log(str(self.cache))
@@ -65,6 +74,7 @@ class Server:
 
         if toCache:
             self.addToCache(response, original_query)
+        self.respectCache()
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"Response sent to client at {client_addr}.")
 
@@ -281,6 +291,9 @@ class Server:
             "record_type": record_type,
             "timestamp": time.time(),
             "original_query": original_query,
+            "next_server": next_server,
+            "retries": 0,
+            "query_data" : query_data
         }
         
         self.log(f"Query sent to {next_server} for {domain} (ID: {query.header.id})")
@@ -345,6 +358,7 @@ class Server:
 
     def bailiwickFilter(self, response, domain):
         self.respectCache()
+        self.retransmit()
         self.log("Filtering response for bailiwick of domain: " + domain)
 
         # Filter answer, additional, and authority sections
@@ -360,6 +374,7 @@ class Server:
         Handles responses from other DNS servers, handling each record type.
         """
         self.respectCache()
+        self.retransmit()
         self.log("Processing response from upstream server")
 
         # Parse the DNS response
@@ -470,8 +485,9 @@ class Server:
         """
         Handles requests from clients.
         """
-        self.log("Client Query")
         self.respectCache()
+        self.retransmit()
+        self.log("Client Query")
         # Parse and handle a client DNS query
         request = DNSRecord.parse(data)
         question = request.questions[0]
@@ -524,6 +540,26 @@ class Server:
 
         self.log("Cache cleanup completed.")
 
+    def retransmit(self):
+        # for unresolved queries that dont have -1 in connected and retries < 5, and have time.time()-time_added > 1
+        # if unresolved queries that dont have -1 in connected and have time.time()-time_added > 1 and  retries >= 5
+        # send a fail to clients
+        for message_id in list(self.unresolved_queries.keys()):
+            focused = self.unresolved_queries[message_id]
+
+            if time.time() - focused["timestamp"] > 1:
+                if focused["retries"] < 5:
+                    # Retransmit
+                    self.log("RETRANSMITTING: Query sent to " + str(focused["next_server"]) +
+                             " for " + str(focused["domain"]) + " ID: " + str(message_id))
+                    focused["retries"] += 1
+                    self.socket.sendto(focused["query_data"], (focused["next_server"], 60053))
+                else:
+                    # Throw it out and send a fail back
+                    self.log("WE SHOULD THROW THIS OUT and send a fail back")
+                    self.unresolved_queries.pop(message_id)
+
+
     def recv(self, socket):
         # Handle incoming requests and upstream responses
         data, addr = socket.recvfrom(65535)
@@ -542,6 +578,7 @@ class Server:
             for conn in socks:
                 self.recv(conn)
                 self.respectCache()
+                self.retransmit()
 
 
         return
