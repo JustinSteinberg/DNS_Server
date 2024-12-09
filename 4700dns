@@ -21,6 +21,9 @@ class Server:
             "MX": [], # [{'priority': 10, 'mail_server': 'mail.example.com.'}, {'priority': 20, 'mail_server': 'mail2.example.com.'}]
             "TXT": {} #{'txt.example.com.': '"txttext"'}
         }
+
+        self.cache = {} # (record type, domain -> response, time, ttl)
+
         
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("0.0.0.0", port))
@@ -35,8 +38,18 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+
+    def addToCache(self, response, query):
+        self.log("Adding to cache!")
+        record_type = QTYPE[query.questions[0].qtype]
+        domain = query.questions[0].qname
+        time_added = time.time()
+        self.cache.update({(record_type, domain) : (response, time_added, response.rr[0].ttl)})
+        self.log(str(time_added))
+        self.log("CACHE:\n")
+        self.log(str(self.cache))
         
-    def send_to_client(self, response, client_addr, original_query_id, original_query):
+    def send_to_client(self, response, client_addr, original_query_id, original_query, toCache=True):
         """
         Sends the response back to the client with necessary modifications.
         """
@@ -50,6 +63,8 @@ class Server:
         for ans in original_query.rr:
             response.add_answer(ans)
 
+        if toCache:
+            self.addToCache(response, original_query)
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"Response sent to client at {client_addr}.")
 
@@ -329,6 +344,7 @@ class Server:
         return [record for record in records if str(record.rname).endswith(domain)]
 
     def bailiwickFilter(self, response, domain):
+        self.respectCache()
         self.log("Filtering response for bailiwick of domain: " + domain)
 
         # Filter answer, additional, and authority sections
@@ -343,6 +359,7 @@ class Server:
         """
         Handles responses from other DNS servers, handling each record type.
         """
+        self.respectCache()
         self.log("Processing response from upstream server")
 
         # Parse the DNS response
@@ -449,12 +466,12 @@ class Server:
             self.log(f"Unhandled record type {record_type}. Returning SERVFAIL.")
             self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
 
-
     def handle_client_query(self, data, addr):
         """
         Handles requests from clients.
         """
         self.log("Client Query")
+        self.respectCache()
         # Parse and handle a client DNS query
         request = DNSRecord.parse(data)
         question = request.questions[0]
@@ -469,11 +486,44 @@ class Server:
             self.log(f"Sending authoritative response to {addr}")
             self.socket.sendto(response.pack(), addr)
         else:
-            # Forward query to the root server to resolve an appopriate answer
-            self.log(f"Forwarding query for {domain} to root server")
-            self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id)
+            # Todo: where should we place elimating caches for TTLS
+            res = self.cache.get((record_type, question.qname), None) # CHECKS CACHE
+            if res is None:
+                # Forward query to the root server to resolve an appopriate answer
+                self.log(f"Forwarding query for {domain} to root server")
+                self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id)
+            else:
+                self.log("CACHE HIT")
+                # self, response, client_addr, original_query_id, original_query
+                self.send_to_client(res[0], addr, request.header.id, request, False)
 
-    
+    def respectCache(self):
+        """
+        Cleans up the cache by removing entries that have expired based on their TTL.
+
+        The cache format is:
+            self.cache = {
+                (record_type, domain): (response, time_added, ttl)
+            }
+        """
+        self.log("Running respectCache to remove expired entries")
+
+        # List of keys to delete (to avoid modifying the dictionary during iteration)
+        keys_to_delete = []
+
+        # Iterate through the cache
+        for rec, (response, time_added, ttl) in self.cache.items():
+            # Check if the current time exceeds the TTL
+            if time.time() - time_added > ttl:
+                self.log(f"Cache entry expired for {rec}. Removing from cache.")
+                keys_to_delete.append(rec)
+
+        # Remove expired entries
+        for key in keys_to_delete:
+            del self.cache[key]
+
+        self.log("Cache cleanup completed.")
+
     def recv(self, socket):
         # Handle incoming requests and upstream responses
         data, addr = socket.recvfrom(65535)
@@ -491,6 +541,8 @@ class Server:
             socks = select.select([self.socket], [], [], 0.1)[0]
             for conn in socks:
                 self.recv(conn)
+                self.respectCache()
+
 
         return
 
