@@ -40,11 +40,16 @@ class Server:
         """
         Sends the response back to the client with necessary modifications.
         """
+
         response.header.id = original_query_id
         response.questions = original_query.questions
         response.header.ra = 1
         response.header.aa = 0
         response.header.tc = 0
+
+        for ans in original_query.rr:
+            response.add_answer(ans)
+
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"Response sent to client at {client_addr}.")
 
@@ -83,7 +88,7 @@ class Server:
                     if rname not in self.zone_data["NS"]:
                         self.zone_data["NS"][rname] = []
                     self.zone_data["NS"][rname].append(str(rdata))
-                    self.log(self.zone_data["NS"])
+                    self.log(str(self.zone_data["NS"]))
                     #print(self.zone_data["NS"])
                 elif rtype == "A":
                     #print("In A")
@@ -320,6 +325,20 @@ class Server:
                     matching_records.append(record)
         return matching_records
 
+    def filter_section(self, records, domain):
+        return [record for record in records if str(record.rname).endswith(domain)]
+
+    def bailiwickFilter(self, response, domain):
+        self.log("Filtering response for bailiwick of domain: " + domain)
+
+        # Filter answer, additional, and authority sections
+        response.rr = self.filter_section(response.rr, domain)  # Answer section
+        response.ar = self.filter_section(response.ar, domain)  # Additional section
+        response.auth = self.filter_section(response.auth, domain)  # Authority section
+
+        self.log(f"Filtered response:\n{response}")
+        return response
+
     def handle_other_DNS_server_response(self, data):
         """
         Handles responses from other DNS servers, handling each record type.
@@ -350,6 +369,8 @@ class Server:
         
         if response.header.aa and len(cname_records) == 0:
             self.log("Authoritative response received. Forwarding to client.")
+            # doing bailiwick checking here, hopefully we didn't recur as much for bailiwicks
+            response = self.bailiwickFilter(response, domain)
             self.send_to_client(response, client_addr, original_query_id, original_query)
             return
         elif response.header.aa and len(cname_records) > 0:
@@ -384,6 +405,8 @@ class Server:
             if cname_records:
                 resolved_name = str(cname_records[0].rdata)
                 self.log(f"Resolving CNAME: {domain} -> {resolved_name}")
+                # response.add_answer(RR("example.com", rtype="A", ttl=300, rdata=A("192.0.2.1")))
+                original_query.add_answer(RR(domain, QTYPE.CNAME, ttl=300, rdata=CNAME(resolved_name)))
                 self.send_dns_query(resolved_name, "A", self.root_ip, client_addr, original_query_id, original_query)
             else:
                 self.log("No CNAME records found. Returning SERVFAIL.")
