@@ -1,17 +1,22 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, select, sys
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE, MX, CNAME, TXT, NS
 
-
+# THE CLASS THAT CONTROLS OUR DNS SERVER, ALL OPERATIONS ARE WITHIN THIS CLASS
 class Server:
+
+    # PURPOSE: To initialize our DNS server with the proper information and data structures to operate the DNS server.
+    # SIG: 1st: the ip of the root server as a string, 2nd: path to our zone_file as a string,
+        # 3rd: port to bind UDP to as int
     def __init__(self, root_ip, zone_file, port):
-        self.root_ip = root_ip
+        self.root_ip = root_ip # ip of the root server
         self.zone_file = zone_file #Zone file
-        self.domain = ""
+        self.domain = "" # domain we are authoritative over
         
-        self.unresolved_queries = {}
-        
+        self.unresolved_queries = {} # here we will save our dns queries that we are awaiting responses
+
+        # Here we will fill our zone data
         self.zone_data = {   # EXAMPLES
             "SOA": None, # {'primary_name_server': 'dns1.example.com.'}
             "NS": {}, # {'example.com.': ['dns1.example.com.', 'dns2.example.com.'], 'sub.example.com.': ['ns2.example.com.']}
@@ -22,8 +27,10 @@ class Server:
             "TXT": {} #{'txt.example.com.': '"txttext"'}
         }
 
+        # here we will save recursive dns answers according to ttl
         self.cache = {} # (record type, domain -> response, time, ttl)
 
+        # socket creation with timeout of 1 second
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(1)
         self.socket = s
@@ -32,19 +39,27 @@ class Server:
 
         self.log("Bound to port %d" % self.port)
 
+    # PURPOSE: To log information about our DNS server to standard error
+    # SIG: 1st: Message as a string we would like to log
     def log(self, message):
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
+    # PURPOSE: To send a DNS query or response to given address
+    # SIG: 1st: a pair of ip and port like (ip, port), 2nd: DNSLib query or response we would like to send
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
 
+    # PURPOSE: To add the given query and response to our cache so that we could cache it later!
+    # SIG: 1st: DNS response we would like to cache, 2nd: DNS query that corresponds to the response
     def addToCache(self, response, query):
         self.log("Adding to cache!")
         record_type = QTYPE[query.questions[0].qtype]
         domain = query.questions[0].qname
         time_added = time.time()
+
+        # Getting TTL of records
         if len(response.rr) > 0:
             self.cache.update({(record_type, domain): (response, time_added, response.rr[0].ttl)})
         elif len(response.auth) > 0:
@@ -52,14 +67,18 @@ class Server:
         elif len(response.ar) > 0:
             self.cache.update({(record_type, domain): (response, time_added, response.ar[0].ttl)})
         else:
-            self.log("No point in caching, probably bailiwick")
+            self.log("No point in caching, probably bailiwick") # no viable records in response
             return
 
         self.log(str(time_added))
         self.log("CACHE:\n")
         self.log(str(self.cache))
-        self.respectCache()
-        
+        self.respectCache() # Quickly gets rid of any 0 TTLs
+
+    # PURPOSE: Sends the response of the client's query back to the client with necessary modifications
+    # SIG: 1st: DNS response to send back, 2nd: a pair of ip and port like (ip, port),
+        # 3rd: the client's original query's ID, 4th: the client's original query,
+        # 5th: (optional) True or False boolean to know if we should cache this response
     def send_to_client(self, response, client_addr, original_query_id, original_query, toCache=True):
         """
         Sends the response back to the client with necessary modifications.
@@ -67,137 +86,117 @@ class Server:
 
         response.header.id = original_query_id
         response.questions = original_query.questions
+        # setting correct headers, we aren't authoritative of the response and we used recursion
         response.header.ra = 1
         response.header.aa = 0
         response.header.tc = 0
 
         for ans in original_query.rr:
-            response.add_answer(ans)
+            response.add_answer(ans) # add any necessary answers to the query
 
-        if toCache:
+        if toCache: # not to cache if optional param is set to false
             self.addToCache(response, original_query)
         self.respectCache()
-        self.socket.sendto(response.pack(), client_addr)
+        self.socket.sendto(response.pack(), client_addr) # send our response
         self.log(f"Response sent to client at {client_addr}.")
 
+    # PURPOSE: To parse our zone file so we have all the proper information
     def load_zone_file(self):
         """Load and parse the zone file. Splits file up into DNS Records
         """
         self.log(f"Loading zone file: {self.zone_file}")
 
         try:
-            zone_records = ""
             with open(self.zone_file, "r") as file:
                 zone_records = RR.fromZone(file.read())
 
             self.log("Records:\n%s" % zone_records)
 
             for record in zone_records:
-                # print("Record: ", record)
-                # print("rname: ", record.rname)
-                # print("rtype: ", record.rtype)
-                # print("QTYPE: ", QTYPE[record.rtype])
-                # print("rdata: ", record.rdata)
 
                 rtype = QTYPE[record.rtype]
                 rdata = record.rdata
                 rname = str(record.rname)
 
-                if rtype == "SOA":
+                if rtype == "SOA": # if we find the SOA
                     self.domain = rname
                     self.log("Our domain: %s" % self.domain)
-
                     self.zone_data["SOA"] = {
                         "primary_name_server": str(rdata.mname),
                     }
-                elif rtype == "NS":
-                    # print("IN NS")
+
+                elif rtype == "NS": # if we find a NS record
                     if rname not in self.zone_data["NS"]:
                         self.zone_data["NS"][rname] = []
                     self.zone_data["NS"][rname].append(str(rdata))
                     self.log(str(self.zone_data["NS"]))
-                    #print(self.zone_data["NS"])
-                elif rtype == "A":
-                    #print("In A")
-                    #print("rname: ", rname)
-                    #print("data: ", str(rdata))
+
+                elif rtype == "A": # if we find an A record
                     if rname not in self.zone_data["A"]:
                         self.zone_data["A"][rname] = []
                     self.zone_data["A"][rname].append(str(rdata))
-                elif rtype == "AAAA":
+
+                elif rtype == "AAAA": # if we find an AAAA record
                     if rname not in self.zone_data["AAAA"]:
                         self.zone_data["AAAA"][rname] = []
                     self.zone_data["AAAA"][rname].append(str(rdata))
-                elif rtype == "CNAME":
+
+                elif rtype == "CNAME": # if we find an CNAME record
                     self.zone_data["CNAME"][rname] = str(rdata)
-                elif rtype == "MX":
+
+                elif rtype == "MX": # if we find an MX record
                     self.zone_data["MX"].append({"priority": rdata.preference, "mail_server": str(rdata.label)})
-                elif rtype == "TXT":
+
+                elif rtype == "TXT": # if we find an TXT record
                     self.zone_data["TXT"][rname] = str(rdata)
 
-           # print(self.zone_data) # FOR DEBUGGING
         except Exception as e:
             self.log("Could not load zone file: %s" % e)
 
-    # checks and returns the record data for any CNAMEs that match the domain
+    # PURPOSE: checks and returns the record data for any CNAMEs that match the domain
+    # SIG: 1st: The domain associated with the CNAME record we are looking for
     def checkCNAMERecords(self, domain):
-        record_data = self.zone_data["CNAME"].get(domain, "") # this will always return 1
-       # print("IN CHECK")
-        #print(record_data)
+        record_data = self.zone_data["CNAME"].get(domain, "") # this should always return 1 cname if we got here
         return record_data
 
-
-    # returns the record data (so the A records for the domain)
+    # PURPOSE: checks and returns the record data for any A records that match the domain
+    # SIG: 1st: The domain associated with the A records we are looking for
     def checkARecords(self, domain):
         record_data = self.zone_data["A"].get(domain, [])
         return record_data
-    
+
+    # PURPOSE: To check if the given domain is one we are authoriative over
+    # SIG: 1st: The domain we are questioning as a string
     def check_is_authoritative(self, queried_domain):
-        
-        if queried_domain.endswith(self.domain):
-            return True
-        
-        return False
-    
-    def is_authoritative(self, response):
-          # Parse the response using dnslib
-        dns_record = DNSRecord.parse(response)
-        
-        # Check the AA (Authoritative Answer) flag
-        return dns_record.header.aa
+        return queried_domain.endswith(self.domain)
 
-
+    # NOTE: Only use function when we are authoritative over the record
+    # PURPOSE: To check and receive the record that is requested, if we don't have it, we send back a NXDOMAIN status.
+    # SIG: 1st: Record type as a string, 2nd: domain associated with record, 3rd: dns request we are working on
+        # RETURNS: Proper response for your query (because we were authoritative over your requested domain)
     def record_response(self, record_type, domain, request):
-        """Generate a response to DNS queries. Currently only support A and MX records.
-        """
-        # Todo: Handle recursion with DNS flags also probably best to make these seperate functions and pass through the response to fill
         try:
             if record_type == "A":
 
-                # check if there are a's that match with the domain
-                # if there is, do the add answer for each of them in record data
-                # if not, check if there is a cname for that
-                # if there is, add it to the answer, then check for a's with that domain
-                # if there is, add it to the answer
-                # if not, send answer???
                 response = request.reply()
                 self.log("query domain: %s" % domain)
                 record_data = self.checkARecords(domain)
-                if not record_data:
-                    altName = self.checkCNAMERecords(domain)
+                if not record_data: # We do not have the direct A record
+                    altName = self.checkCNAMERecords(domain) # do we have another name for that domain?
                     if altName == "":
+                        # We have no records for ya.
                         self.log(f"No A records found for {domain}")
-
                         response.header.rcode = RCODE.NXDOMAIN
                         return response
                     else:
+                        # We found another name for your requested domain, here are your A records for that name.
                         response.add_answer(RR(domain, QTYPE.CNAME, ttl=60, rdata=CNAME(altName)))
-                        aForCNAME = self.checkARecords(altName)
+                        aForCNAME = self.checkARecords(altName) # gets a records for CNAME
                         for aRec in aForCNAME:
                             response.add_answer(RR(altName, QTYPE.A, ttl=60, rdata=A(aRec)))
                         return response
                 else:
-                    for ip in record_data:
+                    for ip in record_data: # we found your A records :) adding to ur response
                         #print(ip)
                         response.add_answer(RR(domain, QTYPE.A, rdata=A(ip), ttl=60))
                     return response
@@ -205,70 +204,72 @@ class Server:
 
             if record_type == "MX":
                 # Retrieve all MX records for the domain
-                #print("query domain: ", domain)
                 record_data = self.zone_data["MX"]
-                #print("record_data: ", record_data)
                 # If there are no records, return NXDOMAIN
                 if len(record_data) == 0:
                     self.log(f"No MX records found for {domain}")
                     response = request.reply()
-                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
+                    response.header.rcode = RCODE.NXDOMAIN
                     return response
 
                 # Create a response and add all MX records with their priorities and MX
                 response = request.reply()
                 for mx in record_data:
                     response.add_answer(RR(domain, QTYPE.MX, rdata=MX(mx["mail_server"], preference=mx["priority"]), ttl=60))
-
                 return response
 
             if record_type == "TXT":
-                #print("query domain: ", domain)
+                # get all txt records for requested domain
                 record_data = self.zone_data["TXT"].get(domain, "")
-                #print("record_data: ", record_data)
-                if len(record_data) == 0:
+                if len(record_data) == 0: # if we found no txt records, u get a NXDOMAIN
                     self.log(f"No TXT records found for {domain}")
                     response = request.reply()
-                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
+                    response.header.rcode = RCODE.NXDOMAIN
                     return response
                 else:
+                    # here are your TXT Records
                     response = request.reply()
-                    response.add_answer(RR(domain, QTYPE.TXT, rdata=TXT(record_data.strip("""\""""))))
+                    response.add_answer(RR(domain, QTYPE.TXT, rdata=TXT(record_data.strip("""\"""")))) # sanitizing txt
                     return response
 
             if record_type == "NS":
                 response = request.reply()
-               # print("query domain: ", domain)
+                # get all NS records for your requested domain
                 record_data = self.zone_data["NS"].get(domain, [])
-                if len(record_data) == 0:
+                if len(record_data) == 0: # no NS records found, u get NXDOMAIN
                     self.log(f"No NS records found for {domain}")
-                    response.header.rcode = RCODE.NXDOMAIN  # Todo: Is this correct???
+                    response.header.rcode = RCODE.NXDOMAIN
                     return response
                 else:
-                    for ns in record_data:
+                    for ns in record_data: # adding your NS records and any associated A records :)
                         response.add_answer(RR(domain, QTYPE.NS, rdata=NS(ns)))
                         associated = self.checkARecords(ns)
                         for aRec in associated:
                             response.add_ar(RR(ns, QTYPE.A, rdata=A(aRec), ttl=60))
                     return response
 
-
         except Exception as e:
             self.log("Could not retrieve record for %s, record_type: %s, %s" % (domain, record_type, e))
             response = request.reply()
-            response.header.rcode = RCODE.SERVFAIL
+            response.header.rcode = RCODE.SERVFAIL # yeah that record type makes no sense, sorry! u get SERVFAIL
             return response        
 
-
+    # PURPOSE:
+    #         Send DNS Query to the next server and adds the query to the unresolved_queries list.
+    #         We add a timestamp to unresolved queries for later usage.
+    #         We also keep track of the original clients address, the original query id, the type
+    #         of record its requesting, and a copy of the query itself.
+    #
+    # SIG: 1st: domain for DNS query. Below are optional
+        # 2nd: Record type as a string
+        # 3rd: Next server to ask the query for as an ip string
+        # 4th: original client's address as a pair: (ip, port)
+        # 5th: original client's Query's ID as int
+        # 6th: original client's Query
     def send_dns_query(self, domain, record_type="A", next_server=None, client_addr=None, original_query_id=None, original_query=None):
-        """
-        Send DNS Query to the next server and adds the query to the unresolved_queries list.
-        We add a timestamp to unresolved queries for later usage.
-        We also keep track of the original clients address, the original query id, the type
-        of record its requesting, and a copy of the query itself.
-        """
+
         self.retransmit()
-        if not next_server:
+        if not next_server: # we don't know who the next server is! sending back a SERVFAIL
             self.log("No root server provided. Returning SERVFAIL.")
             response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
             response.add_question(DNSRecord.question(domain, record_type))
@@ -302,31 +303,33 @@ class Server:
         
         self.log(f"Query sent to {next_server} for {domain} (ID: {query.header.id})")
         
-        self.socket.sendto(query_data, (next_server, 60053))
-        
-    def send_servfail_to_client(self, domain, record_type, client_addr, original_query_id):
-        """
-        Sends a SERVFAIL response to the client.
-        """
+        self.socket.sendto(query_data, (next_server, 60053)) # sending query to next hop
 
-        if record_type not in QTYPE:
-            self.log(f"Invalid record type: {record_type}. Defaulting to 'A'.")
-            record_type = "A"  # Default to "A" if record_type is invalid
+    # PURPOSE: Sends a SERVFAIL response back to the client.
+    # SIG: 1st: record type as a string, 2nd: original client's address as a pair: (ip, port),
+        # 3rd: original client's Query's ID
+    def send_servfail_to_client(self, record_type, client_addr, original_query_id):
+
+        if record_type not in QTYPE: # just double-checking if this is the reason we got a servfail
+            self.log(f"Invalid record type: {record_type}.")
 
         response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
-        self.log("Example of servfail:")
-        self.log(str(response))
-        #response.add_question(DNSRecord.question(domain, record_type))
+        #self.log("Example of servfail:")
+        #self.log(str(response))
         response.header.id = original_query_id
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"SERVFAIL response sent to client at {client_addr}.")
-        
+
+    # PURPOSE: Decides the next server we need to send our QUERY to based on the given response.
+    # SIG: 1st: DNS response we were given that we know we have another hop to go
+        # 2nd: The domain associated with the record
+        # 3rd: Record type as a string
+        # 4th: original client's address as a pair: (ip, port),
+        # 5th:  original client's Query's ID
+        # 6th: original client's Query
     def query_next_server(self, response, domain, record_type, client_addr, original_query_id, original_query):
-        """
-        Gets the next server we need to send our QUERY to based on the response.
-        """
-        a_records_answer = self.find_records(response.ar, QTYPE.A)
-        next_servers = [str(record.rdata) for record in a_records_answer]
+        a_records_answer = self.find_records(response.ar, QTYPE.A) # get the A records
+        next_servers = [str(record.rdata) for record in a_records_answer] # look for our possible hops in those A records
         
         if next_servers:
             # Loop through all A records and send queries to each server
@@ -338,25 +341,25 @@ class Server:
             nameserver_records = self.find_records(response.auth, QTYPE.NS)
             nameserver_data = [str(record.rdata) for record in nameserver_records]
             
-            if nameserver_data:
+            if nameserver_data: # we have a NS record we can depend on for our next hop
                 self.log("Resolving NS records to IP addresses for further queries.")
                 # Query the root server to resolve the NS names into IPs
                 for ns in nameserver_data:
                     self.send_dns_query(ns, "A", self.root_ip, client_addr, original_query_id, original_query)
-            else:
+            else: # no next hop
                 self.log("No servers left to query. Returning SERVFAIL.")
-                self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
-                
+                self.send_servfail_to_client(record_type, client_addr, original_query_id)
+
+    # PURPOSE: """
+    #         Function to find DNS records of a specific type and domain in
+    #         a specific section (ANSWER, AUTHORITATIVE, ADDITIONAL).
+    #         If domain is not provided then return all records of that type in
+    #         corresponding section. reecords is a list of DNS records to search.
+    #         rtype is the record type to search for (e.g., QTYPE.A, QTYPE.MX) and
+    #         the domain is the name to match against the records against.
+    #         """
+    # SIG: 1st: records to search through, 2nd: Record type you are looking for, 3rd: Optional! Domain to match records to
     def find_records(self, records, rtype, domain=None):
-        """
-        Function to find DNS records of a specific type and domain in 
-        a specific section (ANSWER, AUTHORITATIVE, ADDITIONAL).
-        If domain is not provided then return all records of that type in 
-        corresponding section. reecords is a list of DNS records to search.
-        rtype is the record type to search for (e.g., QTYPE.A, QTYPE.MX) and 
-        the domain is the name to match against the records against.
-        """
-        
         matching_records = []
         for record in records:
             if record.rtype == rtype:
@@ -364,9 +367,13 @@ class Server:
                     matching_records.append(record)
         return matching_records
 
+    # PURPOSE: To check the section of the DNS response and make sure the domain is authoritative over the records
+    # SIG: 1st: Records to filter, 2nd: Domain that qualifies the records as keepers
     def filter_section(self, records, domain):
         return [record for record in records if str(record.rname).endswith(domain)]
 
+    # PURPOSE: To filter out any records in our dns response that DO NOT pass the bailiwick test
+    # SIG: 1st: Response to filter through, 2nd: domain as a string we are checking authority for in the records
     def bailiwickFilter(self, response, domain):
         self.respectCache()
         self.retransmit()
@@ -380,10 +387,10 @@ class Server:
         self.log(f"Filtered response:\n{response}")
         return response
 
+    # NOTE: ONLY USE IF U KNOW ITS A RESPONSE FROM A DNS SERVER AND NOT A CLIENT
+    # PURPOSE: Handles responses from other DNS servers, handling each record type.
+    # SIG: 1st: The raw data from the DNS reserver who sent us this response
     def handle_other_DNS_server_response(self, data):
-        """
-        Handles responses from other DNS servers, handling each record type.
-        """
         self.respectCache()
         self.retransmit()
         self.log("Processing response from upstream server")
@@ -405,7 +412,6 @@ class Server:
         domain = query_metadata["domain"]
         record_type = query_metadata["record_type"]
         original_query = query_metadata["original_query"]
-       #original_domain = original_query.questions[0].qname  # Access the first question in the section
 
         # Check if the response is authoritative
         cname_records = self.find_records(response.rr, QTYPE.CNAME, domain)
@@ -454,7 +460,7 @@ class Server:
                 self.send_dns_query(resolved_name, "A", self.root_ip, client_addr, original_query_id, original_query)
             else:
                 self.log("No CNAME records found. Returning SERVFAIL.")
-                self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
+                self.send_servfail_to_client(record_type, client_addr, original_query_id)
 
         elif record_type == "MX":
             self.log("Handling MX record.")
@@ -492,12 +498,12 @@ class Server:
         else:
             self.log(f"Unhandled record type {record_type}. Returning SERVFAIL.")
             self.log(record_type)
-            self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
+            self.send_servfail_to_client(record_type, client_addr, original_query_id)
 
+
+    # PURPOSE: Handles requests from clients, so ONLY USE THIS IF U KNOW ITS FROM A CLIENT
+    # SIG: 1st: raw data from the client, 2nd: original client's address as a pair: (ip, port),
     def handle_client_query(self, data, addr):
-        """
-        Handles requests from clients.
-        """
         self.respectCache()
         self.retransmit()
         self.log("Client Query")
@@ -508,33 +514,26 @@ class Server:
         record_type = QTYPE[question.qtype]
         self.log(f"Received query for {domain} (Type: {record_type}) from {addr} as ID: {request.header.id}")
 
-        if self.check_is_authoritative(domain):
+        if self.check_is_authoritative(domain): # If we get an authoritative response, we have the answer!
             # Generate an authoritative response
             response = self.record_response(record_type, domain, request)
             response.header.id = request.header.id
             self.log(f"Sending authoritative response to {addr}")
             self.socket.sendto(response.pack(), addr)
         else:
-            # Todo: where should we place elimating caches for TTLS
+            # lets check our cache really quick to see if we can solve this easy
             res = self.cache.get((record_type, question.qname), None) # CHECKS CACHE
-            if res is None:
-                # Forward query to the root server to resolve an appopriate answer
+            if res is None: # Nothing useful in cache, time to do recursive answering
+                # Forward query to the root server to resolve an appropriate answer
                 self.log(f"Forwarding query for {domain} to root server as ID: {request.header.id}")
-                self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id, request) # added request hopefully no breaks
+                self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id, request)
             else:
                 self.log("CACHE HIT")
-                # self, response, client_addr, original_query_id, original_query
                 self.send_to_client(res[0], addr, request.header.id, request, False)
 
+    # PURPOSE: Cleans up the cache by removing entries that have expired based on their TTL.
+    # NOTE:  The cache format is: self.cache = { (record_type, domain): (response, time_added, ttl) }
     def respectCache(self):
-        """
-        Cleans up the cache by removing entries that have expired based on their TTL.
-
-        The cache format is:
-            self.cache = {
-                (record_type, domain): (response, time_added, ttl)
-            }
-        """
         self.log("Running respectCache to remove expired entries")
 
         # List of keys to delete (to avoid modifying the dictionary during iteration)
@@ -553,17 +552,13 @@ class Server:
 
         self.log("Cache cleanup completed.")
 
+    # PURPOSE: Checks our unresolved queries and if we have one that is outgoing for long than a second, retransmit it
+        # as it could have been dropped. If we have retransmitted 5 times already, send back to client a SERVFAIL
     def retransmit(self):
-        # for unresolved queries that dont have -1 in connected and retries < 5, and have time.time()-time_added > 1
-        # if unresolved queries that dont have -1 in connected and have time.time()-time_added > 1 and  retries >= 5
-        # send a fail to clients
-       # self.log("checking retransmissions")
-       # self.log(str(time.time()))
-        #self.log(str(self.unresolved_queries))
         for message_id in list(self.unresolved_queries.keys()):
             focused = self.unresolved_queries[message_id]
 
-            if (time.time() - focused["timestamp"]) > 1:
+            if (time.time() - focused["timestamp"]) > 1: # are we outgoing for more than a second?
                 if focused["retries"] < 5:
                     # Retransmit
                     self.log("RETRANSMITTING: Query sent to " + str(focused["next_server"]) +
@@ -572,31 +567,33 @@ class Server:
                     self.socket.sendto(focused["query_data"], (focused["next_server"], 60053))
                     focused["timestamp"] = time.time()
                 else:
+                    # We have retransmitted 5 times already :(
                     self.log("WE SHOULD THROW THIS OUT and send a fail back FOR:" + str())
                     self.unresolved_queries.pop(message_id)
-                    self.log(focused["record_type"])
-                    self.send_servfail_to_client(focused["domain"], focused["record_type"], focused["client_addr"], focused["original_query_id"])
+                    self.send_servfail_to_client(focused["record_type"], focused["client_addr"], focused["original_query_id"])
 
-
+    # PURPOSE: To recv information from the given socket.
+    # SIG: The socket we will recv from
     def recv(self, sock):
         # Handle incoming requests and upstream responses
         try:
             data, addr = sock.recvfrom(65535)
-            if addr[1] == 60053:
+            if addr[1] == 60053: # if we received from a port 60053, its another DNS server, not a client
                 self.handle_other_DNS_server_response(data)
             else:  # Client query
                 self.handle_client_query(data, addr)
         except Exception as e:
+            # usually happens due to timeout, which is okay and try again later! Check retransmits while we are here.
             self.log(str(e))
             self.retransmit()
-            
+
+    # PURPOSE: Starts off our DNS Server! Run this first!
     def run(self):
-        seq = 0
         
-        self.load_zone_file()
-        socks = select.select([self.socket], [], [])[0]
+        self.load_zone_file() # lets parse our zone file so we can get to know our records
+        socks = select.select([self.socket], [], [])[0] # get our socket
         for conn in socks:
-            while True:
+            while True: # the main operations! (recv will handle all responses and decide the sends)!
                     self.retransmit()
                     self.recv(conn)
                     self.respectCache()
@@ -605,13 +602,19 @@ class Server:
 
         return
 
+# THE BIG MAIN FUNCTION TO START EVERYTHING
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='send data')
+    parser = argparse.ArgumentParser(description='send data') # set up our arg parser
+
+    # add args
     parser.add_argument('root_ip', type=str, help="The IP address of the root server")
     parser.add_argument('zone', type=str, help="The zone file for this server")
     parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
-    args = parser.parse_args()
+    args = parser.parse_args() # parse args
+
+    # print important info
     print(f"Root IP:  {args.root_ip}")
     print(f"Zone file provided: {args.zone}")
-    sender = Server(args.root_ip, args.zone, args.port)
-    sender.run()
+
+    sender = Server(args.root_ip, args.zone, args.port) # set up our DNS server
+    sender.run() # LETS RUN OUR DNS SERVER WOOO!
