@@ -24,8 +24,9 @@ class Server:
 
         self.cache = {} # (record type, domain -> response, time, ttl)
 
-        
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        self.socket = s
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
@@ -265,6 +266,7 @@ class Server:
         We also keep track of the original clients address, the original query id, the type
         of record its requesting, and a copy of the query itself.
         """
+        self.retransmit()
         if not next_server:
             self.log("No root server provided. Returning SERVFAIL.")
             response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
@@ -273,7 +275,7 @@ class Server:
             self.socket.sendto(response.pack(), client_addr)
             return
 
-        self.log(f"Starting recursive resolution for {domain} on server {next_server}")
+        self.log(f"Starting recursive resolution for {domain} on server {next_server} for {str(original_query_id)}")
 
         # Create and send the DNS query
         query = DNSRecord.question(domain, record_type)
@@ -284,6 +286,7 @@ class Server:
 
         # Track the query metadata
         message_id = query.header.id
+        self.log(str(original_query_id) + " vs " + str(message_id))
         self.unresolved_queries[message_id] = {
             "client_addr": client_addr,
             "original_query_id": original_query_id,
@@ -304,8 +307,15 @@ class Server:
         """
         Sends a SERVFAIL response to the client.
         """
+
+        if record_type not in QTYPE:
+            self.log(f"Invalid record type: {record_type}. Defaulting to 'A'.")
+            record_type = "A"  # Default to "A" if record_type is invalid
+
         response = DNSRecord(DNSHeader(qr=1, rcode=RCODE.SERVFAIL))
-        response.add_question(DNSRecord.question(domain, record_type))
+        self.log("Example of servfail:")
+        self.log(str(response))
+        #response.add_question(DNSRecord.question(domain, record_type))
         response.header.id = original_query_id
         self.socket.sendto(response.pack(), client_addr)
         self.log(f"SERVFAIL response sent to client at {client_addr}.")
@@ -403,6 +413,7 @@ class Server:
             self.log("Authoritative response received. Forwarding to client.")
             # doing bailiwick checking here, hopefully we didn't recur as much for bailiwicks
             response = self.bailiwickFilter(response, domain)
+            self.log("about to send answer for " + str(original_query_id))
             self.send_to_client(response, client_addr, original_query_id, original_query)
             return
         elif response.header.aa and len(cname_records) > 0:
@@ -479,6 +490,7 @@ class Server:
 
         else:
             self.log(f"Unhandled record type {record_type}. Returning SERVFAIL.")
+            self.log(record_type)
             self.send_servfail_to_client(domain, record_type, client_addr, original_query_id)
 
     def handle_client_query(self, data, addr):
@@ -493,7 +505,7 @@ class Server:
         question = request.questions[0]
         domain = str(question.qname)
         record_type = QTYPE[question.qtype]
-        self.log(f"Received query for {domain} (Type: {record_type}) from {addr}")
+        self.log(f"Received query for {domain} (Type: {record_type}) from {addr} as ID: {request.header.id}")
 
         if self.check_is_authoritative(domain):
             # Generate an authoritative response
@@ -506,8 +518,8 @@ class Server:
             res = self.cache.get((record_type, question.qname), None) # CHECKS CACHE
             if res is None:
                 # Forward query to the root server to resolve an appopriate answer
-                self.log(f"Forwarding query for {domain} to root server")
-                self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id)
+                self.log(f"Forwarding query for {domain} to root server as ID: {request.header.id}")
+                self.send_dns_query(domain, record_type, self.root_ip, addr, request.header.id, request) # added request hopefully no breaks
             else:
                 self.log("CACHE HIT")
                 # self, response, client_addr, original_query_id, original_query
@@ -544,41 +556,50 @@ class Server:
         # for unresolved queries that dont have -1 in connected and retries < 5, and have time.time()-time_added > 1
         # if unresolved queries that dont have -1 in connected and have time.time()-time_added > 1 and  retries >= 5
         # send a fail to clients
+       # self.log("checking retransmissions")
+       # self.log(str(time.time()))
+        #self.log(str(self.unresolved_queries))
         for message_id in list(self.unresolved_queries.keys()):
             focused = self.unresolved_queries[message_id]
 
-            if time.time() - focused["timestamp"] > 1:
+            if (time.time() - focused["timestamp"]) > 1:
                 if focused["retries"] < 5:
                     # Retransmit
                     self.log("RETRANSMITTING: Query sent to " + str(focused["next_server"]) +
                              " for " + str(focused["domain"]) + " ID: " + str(message_id))
                     focused["retries"] += 1
                     self.socket.sendto(focused["query_data"], (focused["next_server"], 60053))
+                    focused["timestamp"] = time.time()
                 else:
-                    # Throw it out and send a fail back
-                    self.log("WE SHOULD THROW THIS OUT and send a fail back")
+                    self.log("WE SHOULD THROW THIS OUT and send a fail back FOR:" + str())
                     self.unresolved_queries.pop(message_id)
+                    self.log(focused["record_type"])
+                    self.send_servfail_to_client(focused["domain"], focused["record_type"], focused["client_addr"], focused["original_query_id"])
 
 
-    def recv(self, socket):
+    def recv(self, sock):
         # Handle incoming requests and upstream responses
-        data, addr = socket.recvfrom(65535)
-        if addr[1] == 60053:
-            self.handle_other_DNS_server_response(data)
-        else:  # Client query
-            self.handle_client_query(data, addr)
+        try:
+            data, addr = sock.recvfrom(65535)
+            if addr[1] == 60053:
+                self.handle_other_DNS_server_response(data)
+            else:  # Client query
+                self.handle_client_query(data, addr)
+        except Exception as e:
+            self.log(str(e))
+            self.retransmit()
             
     def run(self):
         seq = 0
         
         self.load_zone_file()
-
-        while True:
-            socks = select.select([self.socket], [], [], 0.1)[0]
-            for conn in socks:
-                self.recv(conn)
-                self.respectCache()
-                self.retransmit()
+        socks = select.select([self.socket], [], [])[0]
+        for conn in socks:
+            while True:
+                    self.retransmit()
+                    self.recv(conn)
+                    self.respectCache()
+                    self.retransmit()
 
 
         return
