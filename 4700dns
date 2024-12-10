@@ -58,6 +58,7 @@ class Server:
         self.log(str(time_added))
         self.log("CACHE:\n")
         self.log(str(self.cache))
+        self.respectCache()
         
     def send_to_client(self, response, client_addr, original_query_id, original_query, toCache=True):
         """
